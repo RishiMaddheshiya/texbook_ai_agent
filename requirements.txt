@@ -1,0 +1,11 @@
+# Python 3.11+
+streamlit>=1.50
+plotly>=5.24
+pandas>=2.0
+langgraph>=1.0
+google-genai>=2.0
+pymupdf>=1.26
+chromadb>=1.0
+sentence-transformers>=3.0
+pydantic>=2.7
+python-dotenv>=1.0
