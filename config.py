@@ -11,15 +11,28 @@ BASE_DIR = Path(__file__).resolve().parent
 load_dotenv(BASE_DIR / ".env")
 
 
+def _get(name: str, default=None):
+    """Setting lookup: environment / .env first, then Streamlit secrets (Streamlit Community Cloud)."""
+    val = os.getenv(name)
+    if val is None:
+        try:
+            import streamlit as st
+            if name in st.secrets:
+                val = str(st.secrets[name])
+        except Exception:  # no secrets file, or not running inside Streamlit
+            pass
+    return default if val is None else val
+
+
 def _int(name: str, default: int) -> int:
     try:
-        return int(os.getenv(name, default))
+        return int(_get(name, default))
     except (TypeError, ValueError):
         return default
 
 
 def _bool(name: str, default: bool) -> bool:
-    val = os.getenv(name)
+    val = _get(name)
     if val is None:
         return default
     return val.strip().lower() in {"1", "true", "yes", "on"}
@@ -28,25 +41,25 @@ def _bool(name: str, default: bool) -> bool:
 @dataclass(frozen=True)
 class Settings:
     # --- LLM ---
-    gemini_api_key: str = field(default_factory=lambda: os.getenv("GEMINI_API_KEY", "").strip())
-    gemini_model: str = field(default_factory=lambda: os.getenv("GEMINI_MODEL", "gemini-3.1-flash-lite").strip())
+    gemini_api_key: str = field(default_factory=lambda: _get("GEMINI_API_KEY", "").strip())
+    gemini_model: str = field(default_factory=lambda: _get("GEMINI_MODEL", "gemini-3.1-flash-lite").strip())
     llm_temperature: float = 0.3
     llm_max_output_tokens: int = field(default_factory=lambda: _int("LLM_MAX_OUTPUT_TOKENS", 8192))
     llm_timeout_seconds: int = field(default_factory=lambda: _int("LLM_TIMEOUT_SECONDS", 120))
     llm_max_retries: int = field(default_factory=lambda: _int("LLM_MAX_RETRIES", 2))
     llm_max_retry_wait: int = field(default_factory=lambda: _int("LLM_MAX_RETRY_WAIT", 20))
     # "minimal" / "low" / "medium" / "high"; empty = model default. Lower = faster answers.
-    gemini_thinking_level: str = field(default_factory=lambda: os.getenv("GEMINI_THINKING_LEVEL", "low").strip().lower())
+    gemini_thinking_level: str = field(default_factory=lambda: _get("GEMINI_THINKING_LEVEL", "low").strip().lower())
     # Second "verifier" call: more reliable, but roughly doubles response time. Off by default.
     verify_answers: bool = field(default_factory=lambda: _bool("VERIFY_ANSWERS", False))
 
     # --- Embeddings / retrieval ---
     # bge-small: 33M params, 512-token window, runs comfortably on a laptop CPU.
-    embedding_model: str = field(default_factory=lambda: os.getenv("EMBEDDING_MODEL", "BAAI/bge-small-en-v1.5").strip())
+    embedding_model: str = field(default_factory=lambda: _get("EMBEDDING_MODEL", "BAAI/bge-small-en-v1.5").strip())
     query_instruction: str = "Represent this sentence for searching relevant passages: "
     top_k: int = field(default_factory=lambda: _int("TOP_K", 6))
     # cosine similarity (bge-small, normalised) below this counts as "not relevant to the question"
-    min_relevance: float = field(default_factory=lambda: float(os.getenv("MIN_RELEVANCE", "0.5")))
+    min_relevance: float = field(default_factory=lambda: float(_get("MIN_RELEVANCE", "0.5")))
     relative_cutoff: float = 0.15        # drop hits scoring more than this below the best match
     max_context_chars: int = field(default_factory=lambda: _int("MAX_CONTEXT_CHARS", 14000))
     lesson_chars: int = 7000             # size of one "lesson" in chapter-teaching mode
