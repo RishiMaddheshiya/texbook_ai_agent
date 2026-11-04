@@ -17,7 +17,7 @@ Follow these rules:
 8. Clearly distinguish textbook information from additional explanatory knowledge.
 9. If the answer is unavailable in the uploaded textbook, explicitly say so.
 10. Use simple language without compromising scientific accuracy.
-11. When Hinglish is selected, write Hindi using English alphabets.
+11. Always write in clear, simple English, even if the student writes in Hindi or Hinglish or earlier messages used another language.
 12. Use examples to connect abstract concepts with real engineering applications.
 13. When teaching chapters, preserve the original textbook sequence.
 14. Never assume the student already understands advanced terminology.
@@ -41,18 +41,8 @@ GROUNDING AND CITATION RULES (strict):
 - If a passage is marked as the student's own notes, say so when you use it; the notes are not the textbook.
 """
 
-LANGUAGE_RULES = {
-    "English": "Write the whole answer in clear, simple English.",
-    "Hinglish": (
-        "Write in natural Hinglish: Hindi sentences written in English (Roman) letters, the way Indian engineering "
-        "students talk, e.g. 'Yahan electron ki wavelength bahut chhoti hoti hai, isliye resolution improve hota "
-        "hai.' Keep every technical/scientific term in English (wavelength, Bragg angle, structure factor, "
-        "dislocation, ...) and explain its meaning in simple Hinglish the first time it appears. Equations, "
-        "symbols and units stay standard. Never use Devanagari script in Hinglish mode."),
-    "Hindi": (
-        "Write in simple Hindi using Devanagari script. Keep technical terms in English in brackets the first "
-        "time, e.g. 'तरंगदैर्ध्य (wavelength)'. Equations, symbols and units stay standard."),
-}
+LANGUAGE_RULE = ("Write the entire answer in clear, simple English. Never answer in Hindi or Hinglish, "
+                 "even if the student's message or earlier messages in the conversation are in Hindi or Hinglish.")
 
 DIFFICULTY_RULES = {
     "Beginner": ("Assume first-year engineering background. Start from everyday intuition, define every term, "
@@ -188,7 +178,7 @@ DRAFT ANSWER:
 
 QUIZ_PROMPT = """Create a quiz of exactly {n} questions on: {scope}.
 Use ONLY the supplied textbook passages. Mix the types: multiple-choice (mcq, exactly 4 options), true/false (true_false, options ["True", "False"]), fill in the blank (fill_blank, use "_____" in the question), conceptual (short written answer) and numerical (with given values; solvable from formulas in the passages). Include at least one mcq, one true_false and one conceptual question{numerical_hint}.
-Difficulty: {difficulty}. Language for question text and explanations: {language}
+Difficulty: {difficulty}. Write all question text, options and explanations in English.
 For each question give: the question, its type, options (mcq/true_false only), the correct answer (for mcq: the exact option text), accepted_answers (alternative acceptable answers for fill_blank, e.g. synonyms/symbols), a short explanation that teaches why the answer is right, the topic (a short phrase) and the source tag ([S#]) it is based on.
 Do not repeat these earlier questions: {avoid}"""
 
@@ -198,16 +188,16 @@ MODEL ANSWER: {correct}
 EXPLANATION/KEY POINTS: {explanation}
 STUDENT ANSWER: {student}
 
-Score from 0 to 1 (partial credit allowed for conceptual answers; for numerical answers accept results within about 2% and require correct units). Give feedback that explains why the answer is correct or incorrect and what the complete answer is. Language for feedback: {language}"""
+Score from 0 to 1 (partial credit allowed for conceptual answers; for numerical answers accept results within about 2% and require correct units). Give feedback that explains why the answer is correct or incorrect and what the complete answer is. Write the feedback in English."""
 
 
-def system_prompt(book_name: str, language: str, difficulty: str, outline: str) -> str:
+def system_prompt(book_name: str, difficulty: str, outline: str) -> str:
     author_note = (" by David B. Williams and C. Barry Carter"
                    if "transmission electron microscopy" in book_name.lower() else "")
     return "\n\n".join([
         CORE_SYSTEM_PROMPT.format(book_name=book_name, author_note=author_note),
         GROUNDING_RULES,
-        "LANGUAGE: " + LANGUAGE_RULES.get(language, LANGUAGE_RULES["English"]),
+        "LANGUAGE: " + LANGUAGE_RULE,
         "EXPLANATION LEVEL: " + DIFFICULTY_RULES.get(difficulty, DIFFICULTY_RULES["Intermediate"]),
         "BOOK OUTLINE (chapter titles and PDF page ranges, for orientation only):\n" + outline,
     ])

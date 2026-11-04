@@ -9,8 +9,10 @@ Icons: Lucide (ISC licence), embedded as inline SVG so no extra dependency or ne
 from __future__ import annotations
 
 import html
+import inspect
 import math
 import re
+import time
 import urllib.parse
 from datetime import datetime, timedelta
 
@@ -27,6 +29,7 @@ from pdf_processor import (PDFProcessingError, ProcessedBook, book_id_for, list_
 from retrieval import Embedder, RetrievalError, TextbookIndex
 
 APP_VERSION = "2.0.0"
+MIN_STREAMLIT = (1, 66)  # the redesign's CSS targets this version's widget markup
 st.set_page_config(page_title="Textbook AI", page_icon="✦", layout="wide", initial_sidebar_state="expanded")
 
 # =============================================================================================================
@@ -480,7 +483,6 @@ PAGES = [
     ("progress", "Learning Progress", "chart-line"), ("settings", "Settings", "settings"),
 ]
 PAGE_META = {pid: (label, ico) for pid, label, ico in PAGES}
-LANGUAGES = ["Hinglish", "English", "Hindi"]
 DIFFICULTIES = ["Beginner", "Intermediate", "Advanced"]
 QTYPES = {"MCQ": "mcq", "True / False": "true_false", "Fill in the blank": "fill_blank",
           "Conceptual": "conceptual", "Numerical": "numerical"}
@@ -496,7 +498,7 @@ DONE_TEXT = {"classify": "Understood the request", "retrieve": "Found relevant t
 
 ss = st.session_state
 for k, v in {
-    "p_page": "overview", "p_theme": "dark", "p_language": "Hinglish", "p_difficulty": "Intermediate",
+    "p_page": "overview", "p_theme": "dark", "p_difficulty": "Intermediate",
     "p_mode": LEARNING_MODES[1], "p_verify": settings.verify_answers, "p_book": None, "p_chapter": None,
     "p_api_key": "", "p_explorer_ch": None, "p_dia_src": "Textbook figure", "p_num_chapter": None,
     "p_exam_view": "Exam pack", "p_quiz_diff": None, "p_quiz_types": None, "p_quiz_n": 5, "chats": {}, "learning": {}, "pending": None, "done_uploads": set(),
@@ -513,6 +515,26 @@ def go(page: str, **extra) -> None:
         ss[k] = v
 
 
+def compat(fn):
+    """Call a Streamlit widget, dropping keyword arguments this Streamlit version does not support
+    (e.g. `required=` on segmented_control/pills only exists from Streamlit 1.58)."""
+    try:
+        params = inspect.signature(fn).parameters
+        accepts_any = any(p.kind is inspect.Parameter.VAR_KEYWORD for p in params.values())
+    except (TypeError, ValueError):
+        params, accepts_any = {}, True
+
+    def call(*args, **kw):
+        if not accepts_any:
+            kw = {k: v for k, v in kw.items() if k in params}
+        return fn(*args, **kw)
+    return call
+
+
+segmented = compat(st.segmented_control)
+pills = compat(st.pills)
+
+
 def _sync(pref: str, wkey: str) -> None:
     if ss.get(wkey) is not None:
         ss[pref] = ss[wkey]
@@ -522,7 +544,8 @@ def bound(fn, label: str, pref: str, wkey: str, **kw):
     """Render a widget whose value lives in a persistent preference key (widget keys are garbage-collected
     when a page is not shown, preferences are not)."""
     ss[wkey] = ss[pref]
-    return fn(label, key=wkey, on_change=_sync, args=(pref, wkey), **kw)
+    value = fn(label, key=wkey, on_change=_sync, args=(pref, wkey), **kw)
+    return value if value is not None else ss[pref]  # older Streamlit lets a choice be deselected
 
 
 ICON_BUTTONS: dict[str, str] = {}
@@ -589,10 +612,11 @@ class StudioAgent(TeachingAgent):
     """TeachingAgent with two UI-level integrations: a fixed intent for dedicated workspaces, and images the
     student uploads (problem photos, diagrams) sent to Gemini alongside the textbook context."""
 
-    def __init__(self, book, index, llm, force_intent: str | None = None, user_images: list | None = None):
+    def __init__(self, book, index, llm, force_intent: str | None = None, user_images: list | None = None,
+                 on_token=None):
         self.force_intent = force_intent
         self.user_images = user_images or []
-        super().__init__(book, index, llm)
+        super().__init__(book, index, llm, on_token=on_token)
 
     def node_classify(self, state):
         out = super().node_classify(state)
@@ -810,6 +834,15 @@ def stat_card(key: str, ico: str, value: str, label: str, hint: str = "", trend:
                 f'<div class="ta-stat-hint">{esc(hint)}</div></div>')
 
 
+def timing_line(t: dict) -> str:
+    """'⏱ 6.8 s · Gemini 5.9 s · search 0.4 s · checking 0.0 s' — shows where response time goes."""
+    gem = t.get("teach", 0) + t.get("quiz", 0)
+    parts = [f"⏱ {sum(t.values()):.1f} s", f"Gemini {gem:.1f} s", f"textbook search {t.get('retrieve', 0):.1f} s"]
+    if t.get("verify", 0) > 0.3:
+        parts.append(f"verification {t['verify']:.1f} s")
+    return " · ".join(parts)
+
+
 def typing(text: str, done: list[str]) -> str:
     steps = "".join(f"<li>{esc(s)}</li>" for s in done)
     return (f'<div class="ta-typing"><i><span></span><span></span><span></span></i>{esc(text)}</div>'
@@ -952,26 +985,44 @@ def execute(book: ProcessedBook, req: dict, placeholder, history: list[dict] | N
     if llm is None:
         raise LLMError(key_problem() or "Gemini is not configured.")
     client = QuizTypeAdapter(llm, req["qtypes"]) if req.get("qtypes") else llm
-    agent = StudioAgent(book, get_index(book.book_id), client, force_intent=req.get("intent"),
-                        user_images=req.get("images"))
-    chapter_no = req.get("chapter") if req.get("chapter") is not None else current_chapter(book)
-    state = {"query": req.get("query", ""), "mode": req.get("mode") or ss.p_mode, "language": ss.p_language,
-             "difficulty": req.get("difficulty") or ss.p_difficulty, "chapter_no": chapter_no or None,
-             "history": history or [], "learning": learning_for(book), "action": req.get("action"),
-             "verify": ss.p_verify}
+    box = placeholder.container()
+    text_ph, status_ph = box.empty(), box.empty()
     done: list[str] = []
+    streamed = {"text": "", "last": 0.0}
+
+    def on_token(text: str) -> None:
+        # Show the answer as Gemini writes it (throttled so LaTeX re-rendering stays smooth).
+        streamed["text"] = text
+        now = time.perf_counter()
+        if now - streamed["last"] > 0.12:
+            streamed["last"] = now
+            text_ph.markdown(enhance(text))
+            status_ph.markdown(typing("Your professor is writing…", []), unsafe_allow_html=True)
 
     def on_step(node: str) -> None:
         if node in DONE_TEXT:
             done.append(DONE_TEXT[node])
-        placeholder.markdown(typing(STEP_TEXT.get(node, "Working…"), done), unsafe_allow_html=True)
+        if node == "teach" and streamed["text"]:
+            text_ph.markdown(enhance(streamed["text"]))
+        status_ph.markdown(typing(STEP_TEXT.get(node, "Working…"), [] if streamed["text"] else done),
+                           unsafe_allow_html=True)
 
-    placeholder.markdown(typing(STEP_TEXT[None], done), unsafe_allow_html=True)
+    agent = StudioAgent(book, get_index(book.book_id), client, force_intent=req.get("intent"),
+                        user_images=req.get("images"), on_token=on_token)
+    chapter_no = req.get("chapter") if req.get("chapter") is not None else current_chapter(book)
+    state = {"query": req.get("query", ""), "mode": req.get("mode") or ss.p_mode,
+             "difficulty": req.get("difficulty") or ss.p_difficulty, "chapter_no": chapter_no or None,
+             "history": history or [], "learning": learning_for(book), "action": req.get("action"),
+             "verify": ss.p_verify}
+    status_ph.markdown(typing(STEP_TEXT[None], done), unsafe_allow_html=True)
+    llm.on_status = lambda msg: status_ph.markdown(typing(msg, done), unsafe_allow_html=True)
     try:
         out = agent.run(state, on_step=on_step)
     except (LLMError, RetrievalError) as exc:
         ss.llm_state = ("error", str(exc))
         raise
+    finally:
+        llm.on_status = None
     ss.llm_state = ("ok", "")
     learning = out["learning"]
     log_activity(learning, out.get("intent", ""), req.get("label") or req.get("query", ""),
@@ -1212,6 +1263,8 @@ def render_message(book: ProcessedBook, msg: dict, i: int, is_last: bool) -> Non
                             st.markdown(f"*{t}:*\n" + "\n".join(f"- {x}" for x in ver[k]))
                 for w in msg.get("warnings", []):
                     st.caption("⚠️ " + w)
+        if msg.get("timings"):
+            st.caption(timing_line(msg["timings"]))
         if msg.get("quiz"):
             ibutton("Open Quiz Arena", f"goquiz_{i}", "trophy", type="primary", on_click=go, args=("quiz",))
         if is_last and not msg.get("error"):
@@ -1259,7 +1312,7 @@ def page_professor() -> None:
     chat = chat_for(book.book_id)
     h1, h2 = st.columns([3, 2], vertical_alignment="bottom")
     with h1:
-        page_head("professor", "AI Professor", "Grounded in your textbook · cites PDF pages · Hinglish, English or Hindi")
+        page_head("professor", "AI Professor", "Grounded in your textbook · cites the PDF pages it uses")
     with h2:
         chapter_picker(book, "w_chapter_chat", "Focus chapter")
     no_key_banner()
@@ -1276,21 +1329,7 @@ def page_professor() -> None:
             ibutton("Next lesson", "next_lesson", "play", type="primary", disabled=bool(key_problem()), on_click=request,
                     args=("professor", f"Next lesson: {nxt}"), kwargs={"action": {"type": "teach", "op": "next"}})
 
-    if not chat and not (ss.pending and ss.pending["target"] == "professor"):
-        chat_welcome(book)
-    for i, msg in enumerate(chat):
-        render_message(book, msg, i, is_last=(i == len(chat) - 1 and msg["role"] == "assistant"))
-
-    # ---- composer settings (above the pinned input) ----
-    with st.container(key="composer_bar"):
-        c1, c2, c3 = st.columns([2.2, 2.2, 1], vertical_alignment="bottom")
-        with c1:
-            bound(st.segmented_control, "Teaching language", "p_language", "w_lang_chat", options=LANGUAGES, required=True)
-        with c2:
-            bound(st.selectbox, "Teaching mode", "p_mode", "w_mode_chat", options=LEARNING_MODES)
-        with c3:
-            ibutton("Clear", "clear_chat", "trash-2", disabled=not chat, on_click=lambda: ss.chats.update({book.book_id: []}))
-
+    # read the (bottom-docked) input first, so the welcome screen is skipped when a question arrives
     prompt = st.chat_input("Ask your professor anything… (attach a PDF of notes or a photo of a problem)",
                            key="composer", accept_file=True, file_type=["pdf", "png", "jpg", "jpeg", "webp"],
                            disabled=bool(key_problem()))
@@ -1317,6 +1356,19 @@ def page_professor() -> None:
                    "chapter": None, "qtypes": [], "difficulty": None, "attachment": attach}
         elif notes_msg:
             st.rerun()
+    if not chat and not req:
+        chat_welcome(book)
+    for i, msg in enumerate(chat):
+        render_message(book, msg, i, is_last=(i == len(chat) - 1 and msg["role"] == "assistant"))
+
+    # ---- composer settings (above the pinned input) ----
+    with st.container(key="composer_bar"):
+        c2, c3 = st.columns([3, 1], vertical_alignment="bottom")
+        with c2:
+            bound(st.selectbox, "Teaching mode", "p_mode", "w_mode_chat", options=LEARNING_MODES)
+        with c3:
+            ibutton("Clear", "clear_chat", "trash-2", disabled=not chat, on_click=lambda: ss.chats.update({book.book_id: []}))
+
     if req:
         history = [{"role": m["role"], "content": m["content"]} for m in chat if not m.get("error")]
         chat.append({"role": "user", "content": req["label"] or req["query"], "query": req["query"],
@@ -1328,7 +1380,8 @@ def page_professor() -> None:
                 out = execute(book, req, ph, history)
                 chat.append({"role": "assistant", "content": out.get("answer", ""), "images": out.get("image_pages", []),
                              "verification": out.get("verification"), "warnings": out.get("warnings", []),
-                             "intent": out.get("intent", ""), "quiz": bool(out.get("quiz"))})
+                             "intent": out.get("intent", ""), "quiz": bool(out.get("quiz")),
+                             "timings": out.get("timings", {})})
                 if out.get("quiz"):
                     ss.p_page = "quiz"
             except (LLMError, RetrievalError) as exc:
@@ -1687,7 +1740,7 @@ def page_diagram() -> None:
     left, right = st.columns([2, 3], gap="medium")
     preview, req_args = None, None
     with left, st.container(key="panel_left"):
-        src = bound(st.segmented_control, "Diagram source", "p_dia_src", "w_dia_src",
+        src = bound(segmented, "Diagram source", "p_dia_src", "w_dia_src",
                     options=["Textbook figure", "PDF page", "Upload image"], required=True)
         question = st.text_input("What should the professor focus on? (optional)", key="dia_q",
                                  placeholder="e.g. Why is the objective aperture placed here?")
@@ -1812,7 +1865,7 @@ def page_exam() -> None:
     if ss.p_exam_view not in views:
         ss.p_exam_view = views[0]
     if len(views) > 1:
-        bound(st.segmented_control, "Show", "p_exam_view", "w_exam_view", options=views, required=True,
+        bound(segmented, "Show", "p_exam_view", "w_exam_view", options=views, required=True,
               label_visibility="collapsed")
     res = ss.results["exam_exam" if ss.p_exam_view == "Exam pack" else "exam_revision"]
     if res.get("error"):
@@ -1864,11 +1917,11 @@ def quiz_setup(book: ProcessedBook, compact: bool = False) -> None:
         with c2:
             if ss.p_quiz_diff not in DIFFICULTIES:
                 ss.p_quiz_diff = ss.p_difficulty
-            bound(st.segmented_control, "Difficulty", "p_quiz_diff", "w_quiz_diff", options=DIFFICULTIES, required=True)
+            bound(segmented, "Difficulty", "p_quiz_diff", "w_quiz_diff", options=DIFFICULTIES, required=True)
         if ss.p_quiz_types is None:
             ss.p_quiz_types = list(QTYPES)
-        bound(st.pills, "Question types", "p_quiz_types", "w_quiz_types", options=list(QTYPES), selection_mode="multi")
-        bound(st.segmented_control, "Number of questions", "p_quiz_n", "w_quiz_n", options=[3, 5, 8, 10], required=True)
+        bound(pills, "Question types", "p_quiz_types", "w_quiz_types", options=list(QTYPES), selection_mode="multi")
+        bound(segmented, "Number of questions", "p_quiz_n", "w_quiz_n", options=[3, 5, 8, 10], required=True)
         types = [QTYPES[t] for t in ss.p_quiz_types] if ss.p_quiz_types else []
         ibutton("Start quiz", "quiz_start", "play", type="primary", disabled=bool(key_problem()) or not types,
                 on_click=request, args=("quiz", f"Quiz — {book.chapter(ch).label}"),
@@ -1928,7 +1981,7 @@ def quiz_play(book: ProcessedBook, learning: dict, quiz: dict) -> None:
             st.warning("Answer first — the correct answer is revealed only after you respond.")
             return
         with st.spinner("Checking your answer…"):
-            result = grade_answer(llm_or_none(), q, answer, ss.p_language)
+            result = grade_answer(llm_or_none(), q, answer)
         learning = record_quiz_answer(learning, result, answer)
         log_activity(learning, "quiz_answer", q["topic"], quiz.get("chapter_no"))
         set_learning(book, learning)
@@ -2082,15 +2135,15 @@ def page_settings() -> None:
         with st.container(key="tile_appearance"):
             md_html(f'<div class="ta-h3">{icon("sun", 16)} Appearance</div>')
             ss["w_theme_seg"] = "Dark" if ss.p_theme == "dark" else "Light"
-            st.segmented_control("Theme", ["Dark", "Light"], key="w_theme_seg", required=True,
-                                 on_change=lambda: ss.update(p_theme=ss.w_theme_seg.lower()))
+            segmented("Theme", ["Dark", "Light"], key="w_theme_seg", required=True,
+                                 on_change=lambda: ss.update(p_theme=(ss.w_theme_seg or ss.p_theme.title()).lower()))
         st.write("")
         with st.container(key="tile_teaching"):
-            md_html(f'<div class="ta-h3">{icon("languages", 16)} Teaching defaults</div>')
-            bound(st.segmented_control, "Teaching language", "p_language", "w_lang_set", options=LANGUAGES, required=True)
-            bound(st.segmented_control, "Explanation difficulty", "p_difficulty", "w_diff_set", options=DIFFICULTIES, required=True)
+            md_html(f'<div class="ta-h3">{icon("graduation-cap", 16)} Teaching defaults</div>')
+            bound(segmented, "Explanation difficulty", "p_difficulty", "w_diff_set", options=DIFFICULTIES, required=True)
             bound(st.selectbox, "Learning mode", "p_mode", "w_mode_set", options=LEARNING_MODES)
-            bound(st.toggle, "Double-check answers against the textbook (second Gemini call)", "p_verify", "w_verify_set")
+            bound(st.toggle, "Double-check answers against the textbook (second Gemini call — about 2× slower)",
+              "p_verify", "w_verify_set")
     with right:
         with st.container(key="tile_api"):
             md_html(f'<div class="ta-h3">{icon("key-round", 16)} Gemini API</div>')
@@ -2132,11 +2185,30 @@ RENDER = {"overview": page_overview, "professor": page_professor, "textbook": pa
           "progress": page_progress, "settings": page_settings}
 
 
+@st.cache_resource(show_spinner=False)
+def warm_up_search() -> bool:
+    """Load the local embedding model once per app start, so the first question is not slowed by it."""
+    try:
+        get_embedder().encode_query("warm up")
+        return True
+    except RetrievalError:
+        return False
+
+
 def main() -> None:
     page = ss.p_page if ss.p_page in RENDER else "overview"
     st.markdown(build_css(ss.p_theme, tuple((pid, ico) for pid, _, ico in PAGES), page), unsafe_allow_html=True)
     book = active_book()
+    if book is not None and "warmed" not in ss:
+        with st.spinner("Preparing your AI professor… (loading the local search model, first start only)"):
+            warm_up_search()
+        ss.warmed = True
     sidebar(book)
+    st_version = tuple(int(x) for x in re.findall(r"\d+", st.__version__)[:2])
+    if st_version < MIN_STREAMLIT:
+        st.warning(f"You are running Streamlit {st.__version__}. Everything works, but the design needs Streamlit "
+                   f"{'.'.join(map(str, MIN_STREAMLIT))}+ to look right. Upgrade with: `pip install -U streamlit`",
+                   icon=":material/upgrade:")
     if page == "professor":
         page_professor()  # not wrapped: st.chat_input must stay at the top level to dock at the bottom
     else:

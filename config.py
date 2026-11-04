@@ -33,8 +33,12 @@ class Settings:
     llm_temperature: float = 0.3
     llm_max_output_tokens: int = field(default_factory=lambda: _int("LLM_MAX_OUTPUT_TOKENS", 8192))
     llm_timeout_seconds: int = field(default_factory=lambda: _int("LLM_TIMEOUT_SECONDS", 120))
-    llm_max_retries: int = field(default_factory=lambda: _int("LLM_MAX_RETRIES", 4))
-    verify_answers: bool = field(default_factory=lambda: _bool("VERIFY_ANSWERS", True))
+    llm_max_retries: int = field(default_factory=lambda: _int("LLM_MAX_RETRIES", 2))
+    llm_max_retry_wait: int = field(default_factory=lambda: _int("LLM_MAX_RETRY_WAIT", 20))
+    # "minimal" / "low" / "medium" / "high"; empty = model default. Lower = faster answers.
+    gemini_thinking_level: str = field(default_factory=lambda: os.getenv("GEMINI_THINKING_LEVEL", "low").strip().lower())
+    # Second "verifier" call: more reliable, but roughly doubles response time. Off by default.
+    verify_answers: bool = field(default_factory=lambda: _bool("VERIFY_ANSWERS", False))
 
     # --- Embeddings / retrieval ---
     # bge-small: 33M params, 512-token window, runs comfortably on a laptop CPU.

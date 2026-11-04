@@ -1,5 +1,5 @@
 # Python 3.11+
-streamlit>=1.50
+streamlit>=1.66
 plotly>=5.24
 pandas>=2.0
 langgraph>=1.0

@@ -57,44 +57,103 @@ class GeminiClient:
         self.client = genai.Client(api_key=cfg.gemini_api_key,
                                    http_options=types.HttpOptions(timeout=cfg.llm_timeout_seconds * 1000))
         self.calls = 0
+        self.last_seconds = 0.0
+        self.on_status: Callable[[str], None] | None = None  # UI hook: "rate limited, retrying in 12 s"
+        self._thinking_ok = bool(cfg.gemini_thinking_level)
 
-    def generate(self, system: str, contents: list[Any], schema: type[BaseModel] | None = None,
-                 temperature: float | None = None, max_tokens: int | None = None):
+    def _config(self, system: str, schema, temperature, max_tokens):
         t = self._types
         config = t.GenerateContentConfig(
             system_instruction=system,
             temperature=self.cfg.llm_temperature if temperature is None else temperature,
             max_output_tokens=max_tokens or self.cfg.llm_max_output_tokens)
+        if self._thinking_ok:
+            # Less "thinking" = much faster first token. Thinking tokens also count towards max_output_tokens.
+            config.thinking_config = t.ThinkingConfig(thinking_level=self.cfg.gemini_thinking_level.upper())
         if schema is not None:
             config.response_mime_type = "application/json"
             config.response_schema = schema
+        return config
+
+    def _with_retries(self, call: Callable[[], Any], started: Callable[[], bool] = lambda: False):
+        """Run `call` with exponential backoff on rate limits, overload and network errors."""
         delay = 2.0
         last: Exception | None = None
         for attempt in range(self.cfg.llm_max_retries + 1):
+            t0 = time.perf_counter()
             try:
                 self.calls += 1
-                resp = self.client.models.generate_content(model=self.cfg.gemini_model, contents=contents,
-                                                           config=config)
-                return self._read(resp, schema)
+                result = call()
+                self.last_seconds = time.perf_counter() - t0
+                return result
             except self._errors.APIError as exc:
                 last = exc
                 code = getattr(exc, "code", 0) or 0
                 text = str(exc)
+                if code == 400 and self._thinking_ok and re.search(r"thinking", text, re.I):
+                    self._thinking_ok = False  # this model does not accept the thinking level: retry without it
+                    continue
                 if code == 429 and re.search(r"per ?day|PerDay|daily", text, re.I):
                     raise LLMError("The daily free-tier quota for this Gemini model is used up. It resets every "
                                    "24 hours; you can also set GEMINI_MODEL in .env to another free model.") from exc
-                if code not in (429, 500, 502, 503, 504) or attempt == self.cfg.llm_max_retries:
+                if code not in (429, 500, 502, 503, 504) or attempt == self.cfg.llm_max_retries or started():
                     raise LLMError(self._friendly(code, text)) from exc
                 wait = _retry_after(exc) or delay
+                why = "Gemini rate limit reached" if code == 429 else "Gemini is busy"
             except (httpx.TimeoutException, httpx.TransportError, TimeoutError, ConnectionError) as exc:
                 last = exc
-                if attempt == self.cfg.llm_max_retries:
+                if attempt == self.cfg.llm_max_retries or started():
                     raise LLMError("The Gemini API did not respond in time (network problem or timeout). "
                                    "Please check your internet connection and try again.") from exc
-                wait = delay
-            time.sleep(min(wait, 60) + random.uniform(0, 1))
-            delay = min(delay * 2, 60)
+                wait, why = delay, "Network problem"
+            wait = min(wait, self.cfg.llm_max_retry_wait) + random.uniform(0, 1)
+            if self.on_status:
+                self.on_status(f"{why} — retrying in {wait:.0f} s (attempt {attempt + 2} of {self.cfg.llm_max_retries + 1})")
+            time.sleep(wait)
+            delay = min(delay * 2, self.cfg.llm_max_retry_wait)
         raise LLMError(f"Gemini request failed: {last}")
+
+    def generate(self, system: str, contents: list[Any], schema: type[BaseModel] | None = None,
+                 temperature: float | None = None, max_tokens: int | None = None):
+        def call():
+            resp = self.client.models.generate_content(
+                model=self.cfg.gemini_model, contents=contents,
+                config=self._config(system, schema, temperature, max_tokens))
+            return self._read(resp, schema)
+        return self._with_retries(call)
+
+    def generate_stream(self, system: str, contents: list[Any], on_text: Callable[[str], None],
+                        temperature: float | None = None, max_tokens: int | None = None) -> str:
+        """Stream a plain-text answer, calling on_text(text_so_far) as chunks arrive. Returns the full text.
+        Retries only happen before the first chunk, so the student never sees a half answer restart."""
+        got_chunk = {"v": False}
+
+        def call():
+            text, finish, block = "", "", None
+            stream = self.client.models.generate_content_stream(
+                model=self.cfg.gemini_model, contents=contents,
+                config=self._config(system, None, temperature, max_tokens))
+            for chunk in stream:
+                try:
+                    piece = chunk.text or ""
+                except Exception:
+                    piece = ""
+                try:
+                    finish = str(chunk.candidates[0].finish_reason or finish)
+                except Exception:
+                    pass
+                block = getattr(getattr(chunk, "prompt_feedback", None), "block_reason", None) or block
+                if piece:
+                    got_chunk["v"] = True
+                    text += piece
+                    on_text(text)
+            if not text:
+                raise LLMError(f"The model returned no text (finish reason: {finish or block or 'unknown'}). "
+                               "Try rephrasing the question.")
+            if "MAX_TOKENS" in finish:
+                text += "\n\n*(The answer hit the length limit — type **continue** to get the rest.)*"
+            return text
+        return self._with_retries(call, started=lambda: got_chunk["v"])
 
     def _friendly(self, code: int, text: str) -> str:
         model = self.cfg.gemini_model
@@ -212,7 +271,6 @@ class AgentState(TypedDict, total=False):
     # inputs
     query: str
     mode: str
-    language: str
     difficulty: str
     chapter_no: Optional[int]
     history: list[dict]
@@ -237,6 +295,7 @@ class AgentState(TypedDict, total=False):
     warnings: list[str]
     suggestions: list[dict]
     quiz: dict
+    timings: dict
 
 
 # ---------------------------------------------------------------------------
@@ -401,9 +460,10 @@ def clean_answer(text: str, valid_tags: set[str]) -> str:
 # ---------------------------------------------------------------------------
 class TeachingAgent:
     def __init__(self, book: ProcessedBook, index: TextbookIndex, llm: GeminiClient | None,
-                 cfg: Settings | None = None):
+                 cfg: Settings | None = None, on_token: Callable[[str], None] | None = None):
         self.book, self.index, self.llm = book, index, llm
         self.cfg = cfg or default_settings
+        self.on_token = on_token  # optional UI hook: receives the answer text as it streams in
         self.outline = "\n".join(f"Chapter {c.number}: {c.title} (PDF pp. {c.page_start}–{c.page_end})"
                                  for c in book.chapters)
         self.graph = self._build()
@@ -439,12 +499,18 @@ class TeachingAgent:
 
     def run(self, state: AgentState, on_step: Callable[[str], None] | None = None) -> AgentState:
         final: dict = dict(state)
+        timings: dict[str, float] = {}
+        t0 = time.perf_counter()
         for update in self.graph.stream(state, stream_mode="updates"):
+            now = time.perf_counter()
             for node, delta in update.items():
+                timings[node] = round(now - t0, 2)
                 if delta:
                     final.update(delta)
                 if on_step:
                     on_step(node)
+            t0 = now
+        final["timings"] = timings
         return final  # type: ignore[return-value]
 
     def _require_llm(self) -> GeminiClient:
@@ -668,9 +734,12 @@ class TeachingAgent:
             parts.append("CONVERSATION SO FAR (most recent last):\n" + hist)
         parts.append("TEXTBOOK PASSAGES:\n" + (state.get("context") or "(no relevant passages found)"))
         parts.append("STUDENT'S MESSAGE:\n" + (state.get("query") or "(pressed the button for this task)"))
-        system = system_prompt(self.book.name, state.get("language", "English"),
-                               state.get("difficulty", "Intermediate"), self.outline)
-        draft = llm.generate(system, ["\n\n".join(parts), *image_parts])
+        system = system_prompt(self.book.name, state.get("difficulty", "Intermediate"), self.outline)
+        contents = ["\n\n".join(parts), *image_parts]
+        if self.on_token and hasattr(llm, "generate_stream"):
+            draft = llm.generate_stream(system, contents, self.on_token)
+        else:
+            draft = llm.generate(system, contents)
         return {"draft": draft, "image_pages": shown}
 
     # ---- Node 5: Answer Verifier ----
@@ -691,11 +760,10 @@ class TeachingAgent:
                       "below is general knowledge, not taken from the book.\n\n" + answer)
         if state.get("verify") and self.llm is not None and state.get("context"):
             try:
-                image_parts, _ = self._images(state.get("image_pages", []))
                 prompt = VERIFY_PROMPT.format(question=state.get("query") or INTENT_LABELS.get(state["intent"], ""),
                                               context=state["context"], draft=answer)
                 res: VerificationResult = self.llm.generate(
-                    "You verify textbook-grounded teaching answers for accuracy.", [prompt, *image_parts],
+                    "You verify textbook-grounded teaching answers for accuracy.", [prompt],
                     schema=VerificationResult, temperature=0.1)
                 report = {"checked_by_llm": True, **res.model_dump(exclude={"revised_answer"})}
                 if res.verdict == "revise" and len(res.revised_answer) >= 0.6 * len(answer):
@@ -783,13 +851,10 @@ class TeachingAgent:
             scope = f"{state['query']} ({scope})"
         prompt = QUIZ_PROMPT.format(
             n=n, scope=scope, difficulty=state.get("difficulty", "Intermediate"),
-            language=state.get("language", "English") + (" (Hindi in Roman letters, technical terms in English)"
-                                                          if state.get("language") == "Hinglish" else ""),
             numerical_hint=" and one numerical question if the passages contain a usable formula",
             avoid="; ".join(learning.get("asked_questions", [])[-15:]) or "none")
         prompt += "\n\nTEXTBOOK PASSAGES:\n" + state.get("context", "")
-        system = system_prompt(self.book.name, state.get("language", "English"),
-                               state.get("difficulty", "Intermediate"), self.outline)
+        system = system_prompt(self.book.name, state.get("difficulty", "Intermediate"), self.outline)
         result: QuizSet = llm.generate(system, [prompt], schema=QuizSet, temperature=0.6)
         by_tag = {s["tag"]: s for s in state.get("sources", [])}
         questions = []
@@ -886,7 +951,7 @@ def _normalise_question(q: QuizQuestion) -> QuizQuestion | None:
     return q
 
 
-def grade_answer(llm: GeminiClient | None, question: dict, student: str, language: str) -> dict:
+def grade_answer(llm: GeminiClient | None, question: dict, student: str) -> dict:
     """Grade one answer. MCQ/true-false/fill-blank are graded locally; written answers by the LLM."""
     qtype, correct = question["qtype"], question["correct_answer"]
     student = student.strip()
@@ -910,7 +975,7 @@ def grade_answer(llm: GeminiClient | None, question: dict, student: str, languag
         res: AnswerEvaluation = llm.generate(
             "You are a fair, encouraging examiner.",
             [QUIZ_EVAL_PROMPT.format(qtype=qtype, question=question["question"], correct=correct,
-                                     explanation=question["explanation"], student=student, language=language)],
+                                     explanation=question["explanation"], student=student)],
             schema=AnswerEvaluation, temperature=0.1)
         score = max(0.0, min(1.0, float(res.score)))
         return {"score": score, "correct": res.is_correct or score >= 0.7, "feedback": res.feedback}
